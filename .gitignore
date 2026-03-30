@@ -1,0 +1,5 @@
+build/
+cmake-cache/
+.lock-ns3_linux_build
+flow_stats.txt
+examples/Reverie/dump/

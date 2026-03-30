@@ -25,15 +25,16 @@
 #include "ns3/simulator.h"
 #include "ns3/qbb-net-device.h"
 #include "ns3/point-to-point-channel.h"
-// #include "ns3/point-to-point-remote-channel.h"
 #include "ns3/qbb-channel.h"
-// #include "ns3/qbb-remote-channel.h"
+#include "ns3/qbb-remote-channel.h"
 #include "ns3/queue.h"
 #include "ns3/config.h"
 #include "ns3/packet.h"
 #include "ns3/names.h"
-// #include "ns3/mpi-interface.h"
-// #include "ns3/mpi-receiver.h"
+#ifdef NS3_MPI
+#include "ns3/mpi-interface.h"
+#include "ns3/mpi-receiver.h"
+#endif
 
 #include "ns3/trace-helper.h"
 #include "point-to-point-helper.h"
@@ -250,42 +251,39 @@ QbbHelper::Install (Ptr<Node> a, Ptr<Node> b)
   devB->SetQueue (queueB);
 
 
-  // If MPI is enabled, we need to see if both nodes have the same system id 
-  // (rank), and the rank is the same as this instance.  If both are true, 
-  //use a normal p2p channel, otherwise use a remote channel
+  // If MPI is enabled, we need to see if both nodes have the same system id
+  // (rank), and the rank is the same as this instance.  If both are true,
+  // use a normal p2p channel, otherwise use a remote channel.
   bool useNormalChannel = true;
   Ptr<QbbChannel> channel = 0;
-  // if (MpiInterface::IsEnabled ())
-  // //   {
-  // //     uint32_t n1SystemId = a->GetSystemId ();
-  // //     uint32_t n2SystemId = b->GetSystemId ();
-  // //     uint32_t currSystemId = MpiInterface::GetSystemId ();
-  // //     if (n1SystemId != currSystemId || n2SystemId != currSystemId) 
-  // //       {
-  // //         useNormalChannel = false;
-  // //       }
-  //   std:cout << "Can't use MPI. It was originally supported. Feel free to uncomment and start debugging Funtion QbbHelper::Install (Ptr<Node> a, Ptr<Node> b) /src/point-to-point/model/qbb-helper.cc"
-  //   NS_ASSERT(0);
-  //   }
+#ifdef NS3_MPI
+  if (MpiInterface::IsEnabled())
+    {
+      uint32_t n1SystemId = a->GetSystemId();
+      uint32_t n2SystemId = b->GetSystemId();
+      uint32_t currSystemId = MpiInterface::GetSystemId();
+      if (n1SystemId != currSystemId || n2SystemId != currSystemId)
+        {
+          useNormalChannel = false;
+        }
+    }
+#endif
   if (useNormalChannel)
     {
-
-      channel = m_channelFactory.Create<QbbChannel> ();
+      channel = m_channelFactory.Create<QbbChannel>();
     }
-    else{
-      std::cout << "Can't use MPI. It was originally supported. Feel free to uncomment and start debugging Funtion QbbHelper::Install (Ptr<Node> a, Ptr<Node> b) /src/point-to-point/model/qbb-helper.cc" << std::endl;
-      NS_ASSERT(0);
+#ifdef NS3_MPI
+  else
+    {
+      channel = m_remoteChannelFactory.Create<QbbRemoteChannel>();
+      Ptr<MpiReceiver> mpiRecA = CreateObject<MpiReceiver>();
+      Ptr<MpiReceiver> mpiRecB = CreateObject<MpiReceiver>();
+      mpiRecA->SetReceiveCallback(MakeCallback(&QbbNetDevice::Receive, devA));
+      mpiRecB->SetReceiveCallback(MakeCallback(&QbbNetDevice::Receive, devB));
+      devA->AggregateObject(mpiRecA);
+      devB->AggregateObject(mpiRecB);
     }
-  // else
-  //   {
-  //     channel = m_remoteChannelFactory.Create<QbbRemoteChannel> ();
-  //     Ptr<MpiReceiver> mpiRecA = CreateObject<MpiReceiver> ();
-  //     Ptr<MpiReceiver> mpiRecB = CreateObject<MpiReceiver> ();
-  //     mpiRecA->SetReceiveCallback (MakeCallback (&QbbNetDevice::Receive, devA));
-  //     mpiRecB->SetReceiveCallback (MakeCallback (&QbbNetDevice::Receive, devB));
-  //     devA->AggregateObject (mpiRecA);
-  //     devB->AggregateObject (mpiRecB);
-  //   }
+#endif
 
   devA->Attach (channel);
   devB->Attach (channel);

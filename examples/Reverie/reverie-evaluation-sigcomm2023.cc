@@ -18,7 +18,10 @@
 #include <ns3/rdma-driver.h>
 #include <ns3/switch-node.h>
 #include <ns3/sim-setting.h>
-//#include "ns3/mpi-interface.h"
+#ifdef NS3_MPI
+#include "ns3/mpi-interface.h"
+#include "ns3/null-message-simulator-impl.h"
+#endif
 
 #include <cmath>
 #include <iomanip>
@@ -356,7 +359,29 @@ vector<uint16_t> flowCom;
 std::unordered_map<FlowKey,uint16_t> flowToPar;//多个DP并行
 std::vector<vector<int>> opDependence;//存储rdma_operate的依赖关系
 std::vector<bool> opStart;//记录这个operate有没有开始过,避免重复启动
-//MPI_Datatype MPI_FlowInfo;
+
+// MPI spatial partition: node_id -> mpi_rank (-1 = ghost/spine, present on all ranks)
+std::map<uint32_t, int32_t> nodeToRank;
+
+void loadPartition(const std::string& partFile) {
+    std::ifstream f(partFile);
+    if (!f.is_open()) {
+        kira::cout << "[Partition] file not found: " << partFile
+                  << ", running single-process mode." << std::endl;
+        return;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        size_t comma = line.find(',');
+        if (comma == std::string::npos) continue;
+        uint32_t node = static_cast<uint32_t>(std::stoul(line.substr(0, comma)));
+        int32_t  rank = static_cast<int32_t>(std::stol(line.substr(comma + 1)));
+        nodeToRank[node] = rank;
+    }
+    kira::cout << "[Partition] loaded " << nodeToRank.size()
+              << " node->rank entries from " << partFile << std::endl;
+}
 
 void TraceActualPath(uint32_t src_node, uint32_t dst_node, uint16_t sport, uint16_t dport) {
     Ptr<Node> current = n.Get(src_node);
@@ -434,8 +459,15 @@ void flowSend(FlowInfo &flow){
 }*/
 
 void sendPhase(uint16_t par){//指定operate发送下一个phase
-    for(FlowInfo flow:flowInfos[par][phaseCur[par]])
+    for(FlowInfo flow:flowInfos[par][phaseCur[par]]){
+        // MPI: only send flows whose source node belongs to this rank
+        if (!nodeToRank.empty()) {
+            auto it = nodeToRank.find(flow.src_node);
+            if (it == nodeToRank.end() || (it->second != -1 && (uint32_t)it->second != systemId))
+                continue;
+        }
         flowSend(flow);
+    }
 };
 void checkDpd(){//检查依赖关系,该启动的启动
     for(int i=0;i<operateNum;i++){
@@ -616,8 +648,15 @@ void workload_rdma (long &flowCount, int SERVER_COUNT, int LEAF_COUNT, double ST
         for(size_t phase=0;phase<flowInfos[i].size();phase++)//启动operate时记录映射
             for(FlowInfo flow:flowInfos[i][phase])
                 flowToPar[{flow.src_node,flow.dst_node,flow.src_port,flow.dst_port}]=i;
-        for(FlowInfo flow:flowInfos[i][phaseCur[i]])//start first phase
+        for(FlowInfo flow:flowInfos[i][phaseCur[i]]){//start first phase
+            // MPI: only send flows whose source node belongs to this rank
+            if (!nodeToRank.empty()) {
+                auto it = nodeToRank.find(flow.src_node);
+                if (it == nodeToRank.end() || (it->second != -1 && (uint32_t)it->second != systemId))
+                    continue;
+            }
             flowSend(flow);
+        }
     }
     
 }
@@ -649,19 +688,16 @@ void printBuffer(Ptr<OutputStreamWrapper> fout, NodeContainer switches, double d
 /******************************************************************************************************************************************************************************************************/
 
 int main(int argc, char *argv[]){
-    // MpiInterface::Enable(&argc, &argv); // 初始化MPI
-    // systemId = MpiInterface::GetSystemId(); // 获取当前进程ID
-    // systemNum = MpiInterface::GetSize();//记录当前所有进程数
-    // MPI_FlowInfo = create_MPI_FlowInfo();
-
-    // if(systemId!=0){ // 分支进程
-    //     branch_read_info(systemId);
-    //     kira::cout<<"system" <<systemId<<"read end"<<std::endl;
-    //     MPI_Barrier(MPI_COMM_WORLD); // 等待所有进程完成读取
-    //     kira::cout<<"system" <<systemId<<"end"<<std::endl;
-    //     MpiInterface::Disable(); // 禁用MPI
-    //     return systemId;
-    // }
+#ifdef NS3_MPI
+    // Enable MPI and select NullMessage conservative parallel simulator
+    MpiInterface::Enable(&argc, &argv);
+    systemId = MpiInterface::GetSystemId();
+    systemNum = MpiInterface::GetSize();
+    if (systemNum > 1) {
+        GlobalValue::Bind("SimulatorImplementationType",
+                          StringValue("ns3::NullMessageSimulatorImpl"));
+    }
+#endif
     auto main_start_time = std::chrono::high_resolution_clock::now();
 
     std::string confFile = "examples/Reverie/config-workload.txt";
@@ -726,8 +762,17 @@ int main(int argc, char *argv[]){
     std::string pfcOutFile = "./pfc.txt";
     cmd.AddValue ("pfcOutFile", "File path for pfc events", pfcOutFile);
 
+    // MPI spatial partition file (node_id,rank per line)
+    std::string partitionFile = "";
+    cmd.AddValue("partitionFile", "Path to node partition file for MPI (empty = no partition)", partitionFile);
+
     cmd.Parse (argc, argv);
     
+    // Load spatial partition mapping (node -> MPI rank)
+    if (!partitionFile.empty()) {
+        loadPartition(partitionFile);
+    }
+
     namespace fs = std::filesystem;
     
     if (!kira::init_log("examples/Reverie/dump/system"+to_string(taskIndex)+".log")) {
@@ -1070,6 +1115,19 @@ int main(int argc, char *argv[]){
             }
         }
     }
+#ifdef NS3_MPI
+    // Set MPI SystemId on each node according to the partition map.
+    // Spine nodes (rank -1) are ghost nodes owned by all ranks; set to rank 0.
+    if (!nodeToRank.empty()) {
+        for (uint32_t i = 0; i < node_num; i++) {
+            auto it = nodeToRank.find(i);
+            if (it != nodeToRank.end()) {
+                uint32_t assignedRank = (it->second == -1) ? 0 : (uint32_t)it->second;
+                n.Get(i)->SetAttribute("SystemId", UintegerValue(assignedRank));
+            }
+        }
+    }
+#endif
     NS_LOG_INFO("Create nodes.");
     Config::SetDefault ("ns3::Ipv4GlobalRouting::FlowEcmpRouting", BooleanValue(false));
     InternetStackHelper internet;
@@ -1384,9 +1442,9 @@ int main(int argc, char *argv[]){
         simulation_end_time - simulation_start_time);
     kira::cout << std::endl << "total time: " << total_duration.count() << " ms" << std::endl;
     kira::cout << "simulation time: " << sim_duration.count() << " ms" << std::endl;
-    // MPI_Barrier(MPI_COMM_WORLD); // 等待所有进程完成模拟
-    // MPI_Type_free(&MPI_FlowInfo); // 释放MPI数据类型
     NS_LOG_INFO("Done.");
     kira::cout<<"Done"<<std::endl;
-    //MpiInterface::Disable(); // 禁用MPI
+    #ifdef NS3_MPI
+        MpiInterface::Disable(); // shutdown MPI
+    #endif
 }

@@ -1,3 +1,8 @@
+set(reverie_mpi_libs)
+if(${ENABLE_MPI})
+  set(reverie_mpi_libs ${libmpi})
+endif()
+
 build_example(
   NAME reverie-evaluation-sigcomm2023
   SOURCE_FILES 
@@ -10,6 +15,7 @@ build_example(
     ${libtraffic-control}
     ${libinternet}
     ${libapplications}
+    ${reverie_mpi_libs}
 )
 build_example(
   NAME test-parallel
